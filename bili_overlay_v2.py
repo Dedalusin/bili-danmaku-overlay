@@ -869,6 +869,7 @@ class RenderThread(threading.Thread):
                     dense = "、".join(f"{b * 10}~{(b + 1) * 10}分钟" for b, _ in sorted(top))
                     self.status['vdense'] = f"弹幕密集: {dense}"
                     self.status['vload'] = (f"已加载: {vd.title} | "
+                                            f"{len(vd.pages)}P | "
                                             f"时长{vd.duration // 60}分 | 弹幕{n}条 | "
                                             f"弹幕密集: {dense}")
                     self.status['conn'] = '视频已加载, 播放中自动同步'
@@ -908,7 +909,7 @@ class VideoDanmaku:
         self._cookie = ''
 
     def load(self, bvid):
-        """加载视频弹幕 (同步, 会阻塞几秒)"""
+        """加载视频弹幕 (同步, 会阻塞几秒); 分P视频自动合并, 弹幕按P时长偏移"""
         import re
         self.bvid = bvid.strip()
         self._cookie = make_cookie()
@@ -918,9 +919,25 @@ class VideoDanmaku:
             raise RuntimeError(f"视频信息获取失败: {d.get('message')}")
         data = d['data']
         self.title = data['title']
-        self.duration = int(data['duration'])
-        cid = data['cid']
+        pages = data.get('pages') or [{'cid': data['cid'],
+                                       'part': data.get('title', ''),
+                                       'duration': data['duration']}]
+        self.pages = [(p.get('part', ''), int(p.get('duration', 0))) for p in pages]
+        self.duration = sum(dur for _, dur in self.pages)
 
+        all_dms = []
+        offset = 0
+        for p in pages:
+            dms = self._fetch_xml(int(p['cid']))
+            all_dms.extend((t + offset, color, text) for t, color, text in dms)
+            offset += int(p.get('duration', 0))
+        all_dms.sort(key=lambda x: x[0])
+        self.danmaku = all_dms
+        return len(all_dms)
+
+    def _fetch_xml(self, cid):
+        """拉取并解析单个 cid 的弹幕 XML -> [(time, color, text)]"""
+        import re
         req = urllib.request.Request(f'https://comment.bilibili.com/{cid}.xml', headers={
             'User-Agent': UA,
             'Referer': f'https://www.bilibili.com/video/{self.bvid}',
@@ -948,9 +965,7 @@ class VideoDanmaku:
             if mode not in (1, 4):   # 只保留滚动弹幕
                 continue
             dms.append((t, color, text))
-        dms.sort(key=lambda x: x[0])
-        self.danmaku = dms
-        return len(dms)
+        return dms
 
     def find_index(self, t):
         """二分查找: 第一个时间 >= t 的弹幕索引"""
