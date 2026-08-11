@@ -1115,7 +1115,7 @@ class ConsoleApp:
         self.cfg = cfg
         self.root = tk.Tk()
         self.root.title("B站弹幕悬浮窗 控制台")
-        self.root.attributes('-topmost', True)
+        # 控制台不置顶 (只有弹幕窗口需要置顶)
         self.root.resizable(False, False)
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
