@@ -37,7 +37,12 @@ import brotli
 # ============ 配置 ============
 FONT_PATH = r'C:\Windows\Fonts\msyhbd.ttc'
 EMOJI_FONT_PATH = r'C:\Windows\Fonts\seguiemj.ttf'   # Windows emoji 字体
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包: 配置文件放在 exe 所在目录 (__file__ 指向临时解压目录)
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
 DEFAULT_WINDOW_H = 240
 MARGIN_TOP = 8
 DEFAULT_SPEED = 150
