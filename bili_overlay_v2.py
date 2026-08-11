@@ -725,8 +725,11 @@ class RenderThread(threading.Thread):
                 # 视频模式: 按播放进度取弹幕送入队列
                 if self.mode == 'video' and self.video is not None and self.video_loaded:
                     vt = self.status.get('vt')
+                    # 扩展是否活跃 (3秒内上报过 = 扩展接管进度)
+                    ext_alive = (time.time() - self.status.get('ext_last', 0)) < 3
                     # 自动推进: 无扩展时软件自己按真实时间走时间轴
-                    if self.status.get('auto_play') and vt and vt.get('bvid') == self.video.bvid:
+                    if (self.status.get('auto_play') and vt and vt.get('bvid') == self.video.bvid
+                            and not ext_alive):
                         if not self._auto_playing:
                             self._auto_playing = True
                             self._auto_last_wall = time.time()
@@ -859,8 +862,15 @@ class RenderThread(threading.Thread):
                     self.video_last_t = -100
                     self.status['vduration'] = vd.duration
                     self.status['vbvid'] = vd.bvid
+                    # 统计弹幕密集段 (每10分钟一桶, 提示前2名)
+                    import collections
+                    buckets = collections.Counter(int(t // 600) for t, _, _ in vd.danmaku)
+                    top = sorted(buckets.items(), key=lambda x: -x[1])[:2]
+                    dense = "、".join(f"{b * 10}~{(b + 1) * 10}分钟" for b, _ in sorted(top))
+                    self.status['vdense'] = f"弹幕密集: {dense}"
                     self.status['vload'] = (f"已加载: {vd.title} | "
-                                            f"时长{vd.duration // 60}分 | 弹幕{n}条")
+                                            f"时长{vd.duration // 60}分 | 弹幕{n}条 | "
+                                            f"弹幕密集: {dense}")
                     self.status['conn'] = '视频已加载, 播放中自动同步'
                 except Exception as e:
                     self.status['vload'] = f"加载失败: {str(e)[:50]}"
@@ -979,7 +989,7 @@ class ProgressServer(threading.Thread):
                         'playing': bool(body.get('playing', True)),
                         'duration': float(body.get('duration', 0)),
                     }
-                    status_ref['auto_play'] = False   # 扩展上报接管进度, 停自动推进
+                    status_ref['ext_last'] = time.time()   # 扩展最后活跃时间
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b'ok')
@@ -1284,6 +1294,8 @@ class ConsoleApp:
             vp = s.get('vprogress', -1)
             vt = s.get('vt')
             dur = int((vt or {}).get('duration', 0)) or int(s.get('vduration', 0)) or 1
+            ext = s.get('ext_last')
+            ext_str = f"扩展:{'已连接' if ext and time.time() - ext < 5 else '未连接'}"
             # 自动模式下进度条跟随 (用户拖动时跳过)
             if vp is not None and vp >= 0 and not getattr(self, '_vt_dragging', False):
                 self.vt_var.set(min(1000, max(0, int(vp / dur * 1000))))
@@ -1292,9 +1304,10 @@ class ConsoleApp:
             if vp is not None and vp >= 0 and vt:
                 playing = '播放中' if vt.get('playing') else '已暂停'
                 self.status_var.set(
-                    f"{vload} | {int(vp)//60}:{int(vp)%60:02d}/{dur//60}:{dur%60:02d} {playing}")
+                    f"{vload} | {int(vp)//60}:{int(vp)%60:02d}/{dur//60}:{dur%60:02d} "
+                    f"{playing} {ext_str}")
             elif vload:
-                self.status_var.set(f"{vload} | 等待浏览器上报进度 (需安装扩展)")
+                self.status_var.set(f"{vload} | 等待浏览器上报进度 {ext_str}")
             else:
                 self.status_var.set(f"视频模式 | {s.get('conn', '-')}")
             # 自动播放按钮与状态同步 (扩展上报会关闭自动推进)
