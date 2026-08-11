@@ -390,10 +390,10 @@ class RenderThread(threading.Thread):
         self.resizing = False
         self._drag_off = (0, 0)
         self._sdl_set_top = None
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         if self.client:
             self.client.stop()
 
@@ -582,7 +582,7 @@ class RenderThread(threading.Thread):
 
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
-                self._stop.set()
+                self._stop_event.set()
 
     def _rebuild_canvas(self, new_w, new_h):
         self.lw.close()
@@ -618,7 +618,7 @@ class RenderThread(threading.Thread):
             import traceback
             self.status['conn'] = f"渲染线程异常: {type(e).__name__}: {e}"
             traceback.print_exc()
-            self._stop.set()
+            self._stop_event.set()
 
     def _run_inner(self):
         pygame.init()
@@ -680,7 +680,7 @@ class RenderThread(threading.Thread):
         rate_n = 0
         topmost_timer = time.time()
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             self._handle_mouse()
 
             try:
@@ -793,7 +793,7 @@ class RenderThread(threading.Thread):
         elif kind == 'density':
             self.density = int(cmd[1])
         elif kind == 'quit':
-            self._stop.set()
+            self._stop_event.set()
 
 
 # ============ 控制台 (tkinter) ============
