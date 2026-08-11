@@ -13,11 +13,19 @@
     return m ? m[1] : '';
   }
 
+  function getPIndex() {
+    // 分P视频 URL 带 ?p=N 参数 (1-based), 切P时 URL 会更新
+    const p = new URLSearchParams(location.search).get('p');
+    const n = parseInt(p, 10);
+    return (n && n > 0) ? n - 1 : 0;
+  }
+
   function report(t, playing, duration) {
     fetch(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bvid: getBvid(), t: t, playing: playing, duration: duration })
+      body: JSON.stringify({ bvid: getBvid(), t: t, playing: playing,
+                             duration: duration, p: getPIndex() })
     }).catch(function () { /* 悬浮窗未启动时静默失败 */ });
   }
 

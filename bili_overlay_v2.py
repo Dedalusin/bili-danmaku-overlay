@@ -395,7 +395,8 @@ class RenderThread(threading.Thread):
         # 视频模式状态
         self.mode = 'live'                 # 'live' 直播 / 'video' 视频
         self.video = None                  # VideoDanmaku 实例
-        self.video_idx = 0                 # 已消费到第几条
+        self.video_idx = 0                 # 当前P内已消费到第几条
+        self.video_p_idx = -1              # 当前所在P
         self.video_last_t = 0.0            # 上次进度(跳变检测)
         self.video_loaded = False
         self._auto_playing = False         # 无扩展时软件自动推进时间轴
@@ -742,20 +743,27 @@ class RenderThread(threading.Thread):
                     if vt and vt.get('bvid') == self.video.bvid:
                         t = float(vt.get('t', 0))
                         playing = bool(vt.get('playing', True))
-                        # 进度跳变(回退/快进): 清屏重定位
-                        if abs(t - self.video_last_t) > 5:
+                        # 定位当前P: 扩展上报 P 索引 + P内时间; 手动/自动模式用全局时间
+                        vp = int(vt.get('p', -1))
+                        if 0 <= vp < len(self.video.pages):
+                            p_idx, inner_t = vp, t
+                        else:
+                            p_idx, inner_t = self.video.locate(t)
+                        plist = self.video.pages[p_idx][2]
+                        # 跳变(跨P/回退/快进): 清屏重定位
+                        if p_idx != self.video_p_idx or abs(t - self.video_last_t) > 5:
                             self.danmaku.clear()
                             self.lanes = [None] * self.lane_count
-                            self.video_idx = self.video.find_index(t - 0.5)
+                            self.video_p_idx = p_idx
+                            self.video_idx = self.video.find_index(plist, inner_t - 0.5)
                         self.video_last_t = t
                         if playing:
-                            dms = self.video.danmaku
-                            # 弹幕在视频 t 秒时从右缘出现: 送入窗口 [t-0.5, t+3]
-                            while (self.video_idx < len(dms) and
-                                   dms[self.video_idx][0] <= t + 3):
-                                dm_t, color, text = dms[self.video_idx]
+                            # 弹幕在该P内 t 秒时从右缘出现: 窗口 [t-0.5, t+3]
+                            while (self.video_idx < len(plist) and
+                                   plist[self.video_idx][0] <= inner_t + 3):
+                                dm_t, color, text = plist[self.video_idx]
                                 self.video_idx += 1
-                                if dm_t >= t - 0.5:
+                                if dm_t >= inner_t - 0.5:
                                     try:
                                         self.danmaku_queue.put_nowait((text, color))
                                     except queue.Full:
@@ -864,7 +872,8 @@ class RenderThread(threading.Thread):
                     self.status['vbvid'] = vd.bvid
                     # 统计弹幕密集段 (每10分钟一桶, 提示前2名)
                     import collections
-                    buckets = collections.Counter(int(t // 600) for t, _, _ in vd.danmaku)
+                    all_dms = [dm for _, _, dms in vd.pages for dm in dms]
+                    buckets = collections.Counter(int(t // 600) for t, _, _ in all_dms)
                     top = sorted(buckets.items(), key=lambda x: -x[1])[:2]
                     dense = "、".join(f"{b * 10}~{(b + 1) * 10}分钟" for b, _ in sorted(top))
                     self.status['vdense'] = f"弹幕密集: {dense}"
@@ -898,6 +907,59 @@ class RenderThread(threading.Thread):
 
 
 # ============ 视频弹幕 (拉取模式) ============
+def _pb_varint(data, pos):
+    """protobuf varint 解码"""
+    result = 0
+    shift = 0
+    while True:
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, pos
+
+
+def _pb_parse_elems(data):
+    """解析 seg.so 的 protobuf: repeated DanmakuElem elems=1
+    DanmakuElem: 1=id 2=progress(ms) 3=mode 4=fontsize 5=color 7=content"""
+    elems = []
+    pos = 0
+    try:
+        while pos < len(data):
+            tag, pos = _pb_varint(data, pos)
+            field, wt = tag >> 3, tag & 7
+            if wt == 2:
+                ln, pos = _pb_varint(data, pos)
+                chunk = data[pos:pos + ln]
+                pos += ln
+                if field == 1:
+                    d = {}
+                    p2 = 0
+                    while p2 < len(chunk):
+                        t2, p2 = _pb_varint(chunk, p2)
+                        f2, w2 = t2 >> 3, t2 & 7
+                        if w2 == 0:
+                            v, p2 = _pb_varint(chunk, p2)
+                            d[f2] = v
+                        elif w2 == 2:
+                            l2, p2 = _pb_varint(chunk, p2)
+                            d[f2] = chunk[p2:p2 + l2].decode('utf-8', errors='replace')
+                            p2 += l2
+                        elif w2 == 5:
+                            d[f2] = int.from_bytes(chunk[p2:p2 + 4], 'little')
+                            p2 += 4
+                        else:
+                            break
+                    elems.append(d)
+            else:
+                break
+    except Exception:
+        pass
+    return elems
+
+
 class VideoDanmaku:
     """视频弹幕数据: BV号 -> cid -> XML弹幕库, 按时间索引"""
 
@@ -909,7 +971,7 @@ class VideoDanmaku:
         self._cookie = ''
 
     def load(self, bvid):
-        """加载视频弹幕 (同步, 会阻塞几秒); 分P视频自动合并, 弹幕按P时长偏移"""
+        """加载视频弹幕 (同步, 会阻塞几秒); 分P弹幕各自独立 (网页播放器上报的是P内时间)"""
         import re
         self.bvid = bvid.strip()
         self._cookie = make_cookie()
@@ -922,61 +984,79 @@ class VideoDanmaku:
         pages = data.get('pages') or [{'cid': data['cid'],
                                        'part': data.get('title', ''),
                                        'duration': data['duration']}]
-        self.pages = [(p.get('part', ''), int(p.get('duration', 0))) for p in pages]
-        self.duration = sum(dur for _, dur in self.pages)
-
-        all_dms = []
-        offset = 0
+        # 每P独立: (part名, 时长, 弹幕列表[(time,color,text)])
+        self.pages = []
         for p in pages:
-            dms = self._fetch_xml(int(p['cid']))
-            all_dms.extend((t + offset, color, text) for t, color, text in dms)
-            offset += int(p.get('duration', 0))
-        all_dms.sort(key=lambda x: x[0])
-        self.danmaku = all_dms
-        return len(all_dms)
+            dur = int(p.get('duration', 0))
+            dms = self._fetch_segments(int(p['cid']), dur)
+            dms.sort(key=lambda x: x[0])
+            self.pages.append((p.get('part', ''), dur, dms))
+        self.duration = sum(dur for _, dur, _ in self.pages)
+        return sum(len(dms) for _, _, dms in self.pages)
 
-    def _fetch_xml(self, cid):
-        """拉取并解析单个 cid 的弹幕 XML -> [(time, color, text)]"""
-        import re
-        req = urllib.request.Request(f'https://comment.bilibili.com/{cid}.xml', headers={
-            'User-Agent': UA,
-            'Referer': f'https://www.bilibili.com/video/{self.bvid}',
-            'Accept-Encoding': 'gzip, deflate'})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            enc = resp.headers.get('Content-Encoding', '')
-        if enc == 'deflate':
-            xml = zlib.decompress(raw, -zlib.MAX_WBITS).decode('utf-8', errors='replace')
-        elif enc == 'gzip':
-            import gzip
-            xml = gzip.decompress(raw).decode('utf-8', errors='replace')
-        else:
-            xml = raw.decode('utf-8', errors='replace')
+    def locate(self, t):
+        """全局进度 t -> (P索引, P内时间)"""
+        acc = 0
+        for i, (_, dur, _) in enumerate(self.pages):
+            if t < acc + dur or i == len(self.pages) - 1:
+                return i, t - acc
+            acc += dur
+        return 0, 0.0
 
-        dms = []
-        for p, text in re.findall(r'<d p="([^"]+)">(.*?)</d>', xml, re.S):
-            fields = p.split(',')
-            try:
-                t = float(fields[0])
-                mode = int(fields[1])
-                color = int(fields[3])
-            except (ValueError, IndexError):
-                continue
-            if mode not in (1, 4):   # 只保留滚动弹幕
-                continue
-            dms.append((t, color, text))
-        return dms
-
-    def find_index(self, t):
-        """二分查找: 第一个时间 >= t 的弹幕索引"""
-        lo, hi = 0, len(self.danmaku)
+    @staticmethod
+    def find_index(plist, t):
+        """二分查找: 弹幕列表中第一个时间 >= t 的索引"""
+        lo, hi = 0, len(plist)
         while lo < hi:
             mid = (lo + hi) // 2
-            if self.danmaku[mid][0] < t:
+            if plist[mid][0] < t:
                 lo = mid + 1
             else:
                 hi = mid
         return lo
+
+    def _fetch_segments(self, cid, duration):
+        """分段拉取全量弹幕 (seg.so, 每段6分钟, 优于XML的9600条上限)"""
+        import gzip
+        cookie = make_cookie()
+        n_seg = max(1, -(-duration // 360))
+        elems = []
+        for seg in range(1, n_seg + 1):
+            url = (f'https://api.bilibili.com/x/v2/dm/web/seg.so?type=1'
+                   f'&oid={cid}&segment_index={seg}')
+            req = urllib.request.Request(url, headers={
+                'User-Agent': UA,
+                'Referer': f'https://www.bilibili.com/video/{self.bvid}',
+                'Cookie': cookie,
+                'Accept-Encoding': 'gzip, deflate'})
+            try:
+                raw = urllib.request.urlopen(req, timeout=20).read()
+            except Exception:
+                continue
+            # 响应编码不稳定: gzip / deflate / zlib / 原始 都试
+            data = None
+            for fn in (lambda d: gzip.decompress(d),
+                       lambda d: zlib.decompress(d, -zlib.MAX_WBITS),
+                       lambda d: zlib.decompress(d)):
+                try:
+                    data = fn(raw)
+                    break
+                except Exception:
+                    continue
+            if data is None:
+                data = raw
+            elems.extend(_pb_parse_elems(data))
+
+        dms = []
+        for e in elems:
+            mode = e.get(3, 1)
+            if mode not in (1, 4):   # 只保留滚动弹幕
+                continue
+            text = e.get(7, '')
+            if not text:
+                continue
+            dms.append((e.get(2, 0) / 1000.0, e.get(5, 0xFFFFFF), text))
+        return dms
 
 
 class ProgressServer(threading.Thread):
@@ -1003,6 +1083,7 @@ class ProgressServer(threading.Thread):
                         't': float(body.get('t', 0)),
                         'playing': bool(body.get('playing', True)),
                         'duration': float(body.get('duration', 0)),
+                        'p': int(body.get('p', 0)),   # 当前分P索引 (0-based)
                     }
                     status_ref['ext_last'] = time.time()   # 扩展最后活跃时间
                     self.send_response(200)
@@ -1198,7 +1279,8 @@ class ConsoleApp:
         if not bvid:
             return
         t = float(val) / 1000.0 * dur
-        self.status['vt'] = {'bvid': bvid, 't': t, 'playing': True, 'duration': dur}
+        self.status['vt'] = {'bvid': bvid, 't': t, 'playing': True,
+                             'duration': dur, 'p': -1}   # 手动模式: 全局时间
         self.status['auto_play'] = False
         if self.auto_var.get().startswith('⏸'):
             self.auto_var.set("▶ 自动播放")
@@ -1212,11 +1294,14 @@ class ConsoleApp:
             self.status['auto_play'] = False
             self.auto_var.set("▶ 自动播放")
         else:
-            # 从当前进度继续 (没有进度则从 0 开始)
+            # 从当前进度继续 (没有进度则从 0 开始); 自动模式: 全局时间轴
             vt = self.status.get('vt')
             if not vt or vt.get('bvid') != bvid:
                 self.status['vt'] = {'bvid': bvid, 't': 0.0, 'playing': True,
-                                     'duration': int(self.status.get('vduration', 0)) or 1}
+                                     'duration': int(self.status.get('vduration', 0)) or 1,
+                                     'p': -1}
+            else:
+                vt['p'] = -1
             self.status['auto_play'] = True
             self.auto_var.set("⏸ 暂停推进")
 
