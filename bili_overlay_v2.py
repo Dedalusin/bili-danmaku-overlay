@@ -392,6 +392,15 @@ class RenderThread(threading.Thread):
         self._sdl_set_top = None
         self._stop_event = threading.Event()
 
+        # 视频模式状态
+        self.mode = 'live'                 # 'live' 直播 / 'video' 视频
+        self.video = None                  # VideoDanmaku 实例
+        self.video_idx = 0                 # 已消费到第几条
+        self.video_last_t = 0.0            # 上次进度(跳变检测)
+        self.video_loaded = False
+        self._auto_playing = False         # 无扩展时软件自动推进时间轴
+        self._auto_last_wall = 0.0
+
     def stop(self):
         self._stop_event.set()
         if self.client:
@@ -713,6 +722,45 @@ class RenderThread(threading.Thread):
                         except queue.Empty:
                             break
 
+                # 视频模式: 按播放进度取弹幕送入队列
+                if self.mode == 'video' and self.video is not None and self.video_loaded:
+                    vt = self.status.get('vt')
+                    # 自动推进: 无扩展时软件自己按真实时间走时间轴
+                    if self.status.get('auto_play') and vt and vt.get('bvid') == self.video.bvid:
+                        if not self._auto_playing:
+                            self._auto_playing = True
+                            self._auto_last_wall = time.time()
+                        now = time.time()
+                        vt['t'] += now - self._auto_last_wall
+                        vt['playing'] = True
+                        self._auto_last_wall = now
+                    elif not self.status.get('auto_play'):
+                        self._auto_playing = False
+                    if vt and vt.get('bvid') == self.video.bvid:
+                        t = float(vt.get('t', 0))
+                        playing = bool(vt.get('playing', True))
+                        # 进度跳变(回退/快进): 清屏重定位
+                        if abs(t - self.video_last_t) > 5:
+                            self.danmaku.clear()
+                            self.lanes = [None] * self.lane_count
+                            self.video_idx = self.video.find_index(t - 0.5)
+                        self.video_last_t = t
+                        if playing:
+                            dms = self.video.danmaku
+                            # 弹幕在视频 t 秒时从右缘出现: 送入窗口 [t-0.5, t+3]
+                            while (self.video_idx < len(dms) and
+                                   dms[self.video_idx][0] <= t + 3):
+                                dm_t, color, text = dms[self.video_idx]
+                                self.video_idx += 1
+                                if dm_t >= t - 0.5:
+                                    try:
+                                        self.danmaku_queue.put_nowait((text, color))
+                                    except queue.Full:
+                                        pass
+                        self.status['vprogress'] = t
+                    elif not vt:
+                        self.status['vprogress'] = -1   # 等待扩展上报
+
                 spawned = 0
                 while not self.danmaku_queue.empty() and spawned < 8:
                     lane = self._find_lane()
@@ -775,6 +823,48 @@ class RenderThread(threading.Thread):
         kind = cmd[0]
         if kind == 'room':
             self._set_room(cmd[1])
+        elif kind == 'mode':
+            new_mode = cmd[1]
+            if new_mode == self.mode:
+                return
+            self.mode = new_mode
+            self.danmaku.clear()
+            self.lanes = [None] * self.lane_count
+            while not self.danmaku_queue.empty():
+                try:
+                    self.danmaku_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if new_mode == 'video':
+                if self.client:
+                    self.client.stop()
+                    self.client = None
+                self.status['conn'] = '视频模式 (等待扩展上报进度)'
+                self.video_idx = 0
+                self.video_last_t = -100
+            else:
+                room = self.status.get('room', '')
+                if room:
+                    self._set_room(room)
+                else:
+                    self.status['conn'] = '未连接'
+        elif kind == 'load_video':
+            def _do_load():
+                try:
+                    vd = VideoDanmaku()
+                    n = vd.load(cmd[1])
+                    self.video = vd
+                    self.video_loaded = True
+                    self.video_idx = 0
+                    self.video_last_t = -100
+                    self.status['vduration'] = vd.duration
+                    self.status['vbvid'] = vd.bvid
+                    self.status['vload'] = (f"已加载: {vd.title} | "
+                                            f"时长{vd.duration // 60}分 | 弹幕{n}条")
+                    self.status['conn'] = '视频已加载, 播放中自动同步'
+                except Exception as e:
+                    self.status['vload'] = f"加载失败: {str(e)[:50]}"
+            threading.Thread(target=_do_load, daemon=True).start()
         elif kind == 'toggle_visible':
             self.visible = not self.visible
             user32.ShowWindow(self.hwnd, SW_SHOW if self.visible else SW_HIDE)
@@ -794,6 +884,121 @@ class RenderThread(threading.Thread):
             self.density = int(cmd[1])
         elif kind == 'quit':
             self._stop_event.set()
+
+
+# ============ 视频弹幕 (拉取模式) ============
+class VideoDanmaku:
+    """视频弹幕数据: BV号 -> cid -> XML弹幕库, 按时间索引"""
+
+    def __init__(self):
+        self.bvid = ''
+        self.title = ''
+        self.duration = 0
+        self.danmaku = []          # [(time_sec, color, text)] 按时间升序
+        self._cookie = ''
+
+    def load(self, bvid):
+        """加载视频弹幕 (同步, 会阻塞几秒)"""
+        import re
+        self.bvid = bvid.strip()
+        self._cookie = make_cookie()
+        d = http_get('https://api.bilibili.com/x/web-interface/view',
+                     {'bvid': self.bvid}, cookie=self._cookie)
+        if d.get('code') != 0:
+            raise RuntimeError(f"视频信息获取失败: {d.get('message')}")
+        data = d['data']
+        self.title = data['title']
+        self.duration = int(data['duration'])
+        cid = data['cid']
+
+        req = urllib.request.Request(f'https://comment.bilibili.com/{cid}.xml', headers={
+            'User-Agent': UA,
+            'Referer': f'https://www.bilibili.com/video/{self.bvid}',
+            'Accept-Encoding': 'gzip, deflate'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            enc = resp.headers.get('Content-Encoding', '')
+        if enc == 'deflate':
+            xml = zlib.decompress(raw, -zlib.MAX_WBITS).decode('utf-8', errors='replace')
+        elif enc == 'gzip':
+            import gzip
+            xml = gzip.decompress(raw).decode('utf-8', errors='replace')
+        else:
+            xml = raw.decode('utf-8', errors='replace')
+
+        dms = []
+        for p, text in re.findall(r'<d p="([^"]+)">(.*?)</d>', xml, re.S):
+            fields = p.split(',')
+            try:
+                t = float(fields[0])
+                mode = int(fields[1])
+                color = int(fields[3])
+            except (ValueError, IndexError):
+                continue
+            if mode not in (1, 4):   # 只保留滚动弹幕
+                continue
+            dms.append((t, color, text))
+        dms.sort(key=lambda x: x[0])
+        self.danmaku = dms
+        return len(dms)
+
+    def find_index(self, t):
+        """二分查找: 第一个时间 >= t 的弹幕索引"""
+        lo, hi = 0, len(self.danmaku)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.danmaku[mid][0] < t:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+class ProgressServer(threading.Thread):
+    """本地 HTTP 服务: 接收 Chrome 扩展上报的视频播放进度"""
+
+    def __init__(self, status, port=8765):
+        super().__init__(daemon=True)
+        self.status = status
+        self.port = port
+        self._httpd = None
+
+    def run(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        status_ref = self.status
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                try:
+                    n = int(self.headers.get('Content-Length', 0))
+                    body = json.loads(self.rfile.read(n).decode('utf-8'))
+                    status_ref['vt'] = {
+                        'bvid': body.get('bvid', ''),
+                        't': float(body.get('t', 0)),
+                        'playing': bool(body.get('playing', True)),
+                        'duration': float(body.get('duration', 0)),
+                    }
+                    status_ref['auto_play'] = False   # 扩展上报接管进度, 停自动推进
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'ok')
+                except Exception:
+                    self.send_response(400)
+                    self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        try:
+            self._httpd = HTTPServer(('127.0.0.1', self.port), Handler)
+            self._httpd.serve_forever()
+        except OSError as e:
+            print(f"[进度服务] 端口 {self.port} 被占用: {e}", flush=True)
+
+    def stop(self):
+        if self._httpd:
+            self._httpd.shutdown()
 
 
 # ============ 控制台 (tkinter) ============
@@ -860,8 +1065,20 @@ class ConsoleApp:
         frm = ttk.Frame(self.root, padding=10)
         frm.pack(fill=tk.BOTH)
 
-        # 直播间选择 (主播名)
+        # 模式切换
         row = ttk.Frame(frm)
+        row.pack(fill=tk.X, **pad)
+        ttk.Label(row, text="模式:").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value='live')
+        ttk.Radiobutton(row, text="直播", value='live', variable=self.mode_var,
+                        command=self._on_mode_change).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(row, text="视频", value='video', variable=self.mode_var,
+                        command=self._on_mode_change).pack(side=tk.LEFT, padx=4)
+
+        # 直播模式控件
+        self.live_frame = ttk.Frame(frm)
+        self.live_frame.pack(fill=tk.X)
+        row = ttk.Frame(self.live_frame)
         row.pack(fill=tk.X, **pad)
         ttk.Label(row, text="直播间:").pack(side=tk.LEFT)
         self.room_var = tk.StringVar()
@@ -869,9 +1086,7 @@ class ConsoleApp:
                                        state='readonly', width=24)
         self.room_combo.pack(side=tk.LEFT, padx=6)
         self.room_combo.bind('<<ComboboxSelected>>', self._on_room_selected)
-
-        # 添加直播间
-        row = ttk.Frame(frm)
+        row = ttk.Frame(self.live_frame)
         row.pack(fill=tk.X, **pad)
         ttk.Label(row, text="添加(房间号):").pack(side=tk.LEFT)
         self.add_var = tk.StringVar()
@@ -880,6 +1095,42 @@ class ConsoleApp:
         self.add_entry.bind('<Return>', lambda e: self._add_room())
         ttk.Button(row, text="添加", command=self._add_room).pack(side=tk.LEFT)
         ttk.Button(row, text="删除当前", command=self._del_room).pack(side=tk.LEFT, padx=4)
+
+        # 视频模式控件
+        self.video_frame = ttk.Frame(frm)
+        row = ttk.Frame(self.video_frame)
+        row.pack(fill=tk.X, **pad)
+        ttk.Label(row, text="视频BV:").pack(side=tk.LEFT)
+        self.bv_var = tk.StringVar()
+        self.bv_entry = ttk.Entry(row, textvariable=self.bv_var, width=18)
+        self.bv_entry.pack(side=tk.LEFT, padx=6)
+        self.bv_entry.bind('<Return>', lambda e: self._load_video())
+        ttk.Button(row, text="加载", command=self._load_video).pack(side=tk.LEFT)
+        self.vload_var = tk.StringVar(value="输入BV号加载视频弹幕")
+        ttk.Label(self.video_frame, textvariable=self.vload_var,
+                  foreground='#888888').pack(anchor=tk.W, **pad)
+
+        # 手动进度条 (无扩展时拖动跟随; 有扩展时自动刷新)
+        row = ttk.Frame(self.video_frame)
+        row.pack(fill=tk.X, **pad)
+        ttk.Label(row, text="进度:").pack(side=tk.LEFT)
+        self.vt_var = tk.DoubleVar(value=0)
+        self.vt_scale = tk.Scale(row, from_=0, to=1000, resolution=1,
+                                 orient=tk.HORIZONTAL, showvalue=False,
+                                 variable=self.vt_var, length=200,
+                                 command=self._on_vt_manual)
+        self.vt_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self.vt_label = ttk.Label(row, text="0:00 / 0:00", width=14)
+        self.vt_label.pack(side=tk.RIGHT)
+        self._vt_dragging = False
+        self.vt_scale.bind('<ButtonPress-1>', lambda e: setattr(self, '_vt_dragging', True))
+        self.vt_scale.bind('<ButtonRelease-1>', lambda e: setattr(self, '_vt_dragging', False))
+        self.auto_var = tk.StringVar(value="▶ 自动播放")
+        ttk.Button(row, textvariable=self.auto_var, command=self._toggle_auto_play,
+                   width=10).pack(side=tk.LEFT, padx=4)
+        ttk.Label(self.video_frame,
+                  text="提示: 装 Chrome 扩展后自动精确跟随; 不装可用进度条+自动播放",
+                  foreground='#888888').pack(anchor=tk.W, **pad)
 
         self.status_var = tk.StringVar(value="启动中...")
         ttk.Label(frm, textvariable=self.status_var, foreground='#2d8cf0').pack(anchor=tk.W, **pad)
@@ -897,6 +1148,52 @@ class ConsoleApp:
         ttk.Button(frm, text="退出程序", command=self._quit).pack(fill=tk.X, **pad)
 
         self._sync_room_list()
+
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        if mode == 'video':
+            self.live_frame.pack_forget()
+            self.video_frame.pack(fill=tk.X)
+        else:
+            self.video_frame.pack_forget()
+            self.live_frame.pack(fill=tk.X)
+        self.cmd_queue.put(('mode', mode))
+
+    def _load_video(self):
+        bv = self.bv_var.get().strip()
+        if not bv:
+            return
+        self.vload_var.set("加载中...")
+        self.cmd_queue.put(('load_video', bv))
+
+    def _on_vt_manual(self, val):
+        """手动进度条拖动: 直接把进度写入状态 (无需扩展), 同时停止自动推进"""
+        bvid = self.status.get('vbvid', '')
+        dur = int(self.status.get('vduration', 0)) or 1
+        if not bvid:
+            return
+        t = float(val) / 1000.0 * dur
+        self.status['vt'] = {'bvid': bvid, 't': t, 'playing': True, 'duration': dur}
+        self.status['auto_play'] = False
+        if self.auto_var.get().startswith('⏸'):
+            self.auto_var.set("▶ 自动播放")
+
+    def _toggle_auto_play(self):
+        """无扩展时的自动推进: 从当前进度按真实时间走"""
+        bvid = self.status.get('vbvid', '')
+        if not bvid:
+            return
+        if self.status.get('auto_play'):
+            self.status['auto_play'] = False
+            self.auto_var.set("▶ 自动播放")
+        else:
+            # 从当前进度继续 (没有进度则从 0 开始)
+            vt = self.status.get('vt')
+            if not vt or vt.get('bvid') != bvid:
+                self.status['vt'] = {'bvid': bvid, 't': 0.0, 'playing': True,
+                                     'duration': int(self.status.get('vduration', 0)) or 1}
+            self.status['auto_play'] = True
+            self.auto_var.set("⏸ 暂停推进")
 
     # ---- 直播间管理 ----
     @staticmethod
@@ -981,13 +1278,38 @@ class ConsoleApp:
 
     def _refresh_status(self):
         s = self.status
-        room = s.get('room', '-')
-        name = s.get('room_name', '')
-        conn = s.get('conn', '-')
-        fps = s.get('fps', 0)
-        rate = s.get('rate', 0)
-        shown = f"{name} ({room})" if name and name != room else room
-        self.status_var.set(f"当前: {shown} | {conn} | {fps}fps | {rate}条/秒")
+        mode = self.mode_var.get()
+        if mode == 'video':
+            vload = s.get('vload', '')
+            vp = s.get('vprogress', -1)
+            vt = s.get('vt')
+            dur = int((vt or {}).get('duration', 0)) or int(s.get('vduration', 0)) or 1
+            # 自动模式下进度条跟随 (用户拖动时跳过)
+            if vp is not None and vp >= 0 and not getattr(self, '_vt_dragging', False):
+                self.vt_var.set(min(1000, max(0, int(vp / dur * 1000))))
+                self.vt_label.config(
+                    text=f"{int(vp)//60}:{int(vp)%60:02d} / {dur//60}:{dur%60:02d}")
+            if vp is not None and vp >= 0 and vt:
+                playing = '播放中' if vt.get('playing') else '已暂停'
+                self.status_var.set(
+                    f"{vload} | {int(vp)//60}:{int(vp)%60:02d}/{dur//60}:{dur%60:02d} {playing}")
+            elif vload:
+                self.status_var.set(f"{vload} | 等待浏览器上报进度 (需安装扩展)")
+            else:
+                self.status_var.set(f"视频模式 | {s.get('conn', '-')}")
+            # 自动播放按钮与状态同步 (扩展上报会关闭自动推进)
+            if s.get('auto_play') and not self.auto_var.get().startswith('⏸'):
+                self.auto_var.set("⏸ 暂停推进")
+            elif not s.get('auto_play') and self.auto_var.get().startswith('⏸'):
+                self.auto_var.set("▶ 自动播放")
+        else:
+            room = s.get('room', '-')
+            name = s.get('room_name', '')
+            conn = s.get('conn', '-')
+            fps = s.get('fps', 0)
+            rate = s.get('rate', 0)
+            shown = f"{name} ({room})" if name and name != room else room
+            self.status_var.set(f"当前: {shown} | {conn} | {fps}fps | {rate}条/秒")
         self.root.after(500, self._refresh_status)
 
     def _quit(self):
@@ -1023,6 +1345,10 @@ def main():
     danmaku_queue = queue.Queue(maxsize=2000)
     cmd_queue = queue.Queue()
 
+    # 本地进度服务 (接收 Chrome 扩展上报的视频播放进度)
+    progress_server = ProgressServer(status)
+    progress_server.start()
+
     render = RenderThread(danmaku_queue, cmd_queue, status, cfg)
     render.start()
 
@@ -1031,6 +1357,7 @@ def main():
         console.run()
     finally:
         render.stop()
+        progress_server.stop()
         render.join(timeout=3)
 
 

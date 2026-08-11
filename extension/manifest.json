@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "B站弹幕悬浮窗 进度同步",
+  "version": "1.0.0",
+  "description": "把B站视频的播放进度实时同步给本地弹幕悬浮窗 (127.0.0.1:8765)",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.bilibili.com/video/*",
+        "https://www.bilibili.com/bangumi/*",
+        "https://www.bilibili.com/list/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ]
+}
