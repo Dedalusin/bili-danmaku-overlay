@@ -15,7 +15,7 @@
 ```
 pip install pygame websocket-client brotli
 python bili_overlay_v2.py            # 启动, 沿用上次配置
-python bili_overlay_v2.py 1727076670 # 启动并切换到指定直播间
+python bili_overlay_v2.py [直播间ID] # 启动并切换到指定直播间 (支持短号)
 ```
 
 ## 说明
